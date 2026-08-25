@@ -1,0 +1,137 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from sklearn.metrics import roc_curve, auc
+
+# --- Constants and Parameters ---
+c = 3e8          # Speed of light (m/s)
+R = 1.0          # Loop radius (m)
+L0 = 2 * np.pi * R  # Baseline loop length
+lambda_ = 1550e-9   # Wavelength (m)
+n = 1.5          # Effective refractive index
+num_points = 1000    # Number of simulation time steps
+dt = 1e-3        # Time step (s)
+omega = 10.0     # Angular velocity (rad/s)
+A = np.pi * R**2 # Loop area (m^2)
+delta_t_sagnac = (4 * A * omega) / (c**2)  # Baseline Sagnac time delay
+
+# --- 1. Simulate Baseline and Tap Events ---
+time = np.linspace(0, num_points*dt, num_points)
+phase_noise_std = 1e-6   # Radians (environmental noise)
+thermal_drift = 1e-7     # Radians per time step
+
+# Initialize phase difference array (radians)
+dphi = np.zeros(num_points)
+
+# Baseline phase difference (Sagnac + noise)
+phase_baseline = 2 * np.pi * c / lambda_ * delta_t_sagnac
+for i in range(num_points):
+    # Random Gaussian noise + thermal drift
+    noise = np.random.normal(0, phase_noise_std)
+    drift = thermal_drift * i
+    dphi[i] = phase_baseline + noise + drift
+
+# --- 2. Inject Adversarial Tap Event ---
+tap_time_index = 500
+tap_delta_L_nm = 5.0  # Tap perturbation in nanometers
+tap_delta_L_m = tap_delta_L_nm * 1e-9  # Convert to meters
+
+# Tap-induced phase shift
+delta_phi_tap = (2 * np.pi * n / lambda_) * tap_delta_L_m
+
+# Apply tap to the phase difference (asymmetrical perturbation)
+for i in range(tap_time_index, num_points):
+    # Add tap-induced phase shift, plus potential for a gradual start
+    dphi[i] += delta_phi_tap * (1 - np.exp(-(i - tap_time_index)/100))
+
+# --- 3. Statistical Intrusion Detection Engine (Sliding Z-score + CUSUM) ---
+window_size = 50
+threshold = 4.0  # Z-score threshold
+cusum_k = 0.5    # CUSUM drift parameter
+cusum_h = 5.0    # CUSUM decision threshold
+
+z_scores = np.zeros(num_points)
+cusum_scores = np.zeros(num_points)
+alarm_triggered = np.zeros(num_points, dtype=bool)
+
+# Baseline mean and std from the first 100 points
+baseline_mean = np.mean(dphi[:100])
+baseline_std = np.std(dphi[:100])
+
+# CUSUM accumulator
+S_pos = 0
+
+for i in range(window_size, num_points):
+    # Sliding window statistics
+    window = dphi[i-window_size:i]
+    mu = np.mean(window)
+    sigma = np.std(window)
+    if sigma < 1e-12:
+        sigma = 1e-12  # Avoid division by zero
+    z_score = abs(dphi[i] - mu) / sigma
+    z_scores[i] = z_score
+
+    # CUSUM for positive deviations
+    S_pos = max(0, S_pos + z_score - cusum_k)
+    cusum_scores[i] = S_pos
+
+    # Alarm if Z-score exceeds threshold OR CUSUM exceeds threshold
+    if z_score > threshold or S_pos > cusum_h:
+        alarm_triggered[i] = True
+
+# --- 4. Generate Plots ---
+# Plot 1: Real-time Phase Drift vs. Time
+plt.figure(figsize=(12, 6))
+plt.plot(time, dphi * 1e6, 'b-', linewidth=1.0, label='Phase Difference (µrad)')
+plt.axvline(x=time[tap_time_index], color='red', linestyle='--', label='Tap Event Start')
+plt.axhline(y=np.mean(dphi[:100])*1e6 + threshold*np.std(dphi[:100])*1e6,
+            color='orange', linestyle='-', label='Alarm Threshold (Z-score)')
+plt.fill_between(time, (np.mean(dphi[:100]) - 3*np.std(dphi[:100]))*1e6,
+                 (np.mean(dphi[:100]) + 3*np.std(dphi[:100]))*1e6,
+                 color='gray', alpha=0.2, label='3σ Baseline')
+plt.plot(time[alarm_triggered], dphi[alarm_triggered]*1e6, 'rx',
+         markersize=8, label='Alarm Triggered')
+plt.xlabel('Time (s)')
+plt.ylabel('Phase Difference (µrad)')
+plt.title('Real-Time Phase Drift: Baseline vs. Active Tap Event')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# Plot 2: Receiver Operating Characteristic (ROC) Curve
+# Compute ROC by varying threshold and calculating TP, FP rates
+thresholds = np.linspace(1.0, 8.0, 50)
+tpr_list = []
+fpr_list = []
+
+# Ground truth: anomaly present after tap_time_index
+ground_truth = np.zeros(num_points, dtype=int)
+ground_truth[tap_time_index:] = 1
+
+for thresh in thresholds:
+    # Binary classification based on Z-score
+    predictions = (z_scores > thresh)
+    tp = np.sum((predictions == 1) & (ground_truth == 1))
+    fp = np.sum((predictions == 1) & (ground_truth == 0))
+    fn = np.sum((predictions == 0) & (ground_truth == 1))
+    tn = np.sum((predictions == 0) & (ground_truth == 0))
+
+    tpr = tp / (tp + fn + 1e-12)  # True Positive Rate
+    fpr = fp / (fp + tn + 1e-12)  # False Positive Rate
+    tpr_list.append(tpr)
+    fpr_list.append(fpr)
+
+# Compute AUC
+roc_auc = auc(fpr_list, tpr_list)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr_list, tpr_list, 'b-', linewidth=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
+plt.plot([0, 1], [0, 1], 'r--', label='Random Classifier')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate (1 - Specificity)')
+plt.ylabel('True Positive Rate (Sensitivity)')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc="lower right")
+plt.grid(True, alpha=0.3)
+plt.show()
